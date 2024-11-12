@@ -1,6 +1,26 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import warnings
+
+warnings.filterwarnings("ignore")
+
+class NCAModule(nn.Module):
+    def __init__(self, state_dim, hidden_dim):
+        super(NCAModule, self).__init__()
+        self.conv = nn.Conv2d(state_dim, hidden_dim, kernel_size=3, padding=1)
+        self.fc = nn.Linear(hidden_dim, state_dim)
+
+    def forward(self, x):
+        # x: (batch_size, channels, height, width)
+        x = self.conv(x)
+        x = F.relu(x)
+        x = x.permute(0, 2, 3, 1)  # (batch_size, height, width, channels)
+        x = self.fc(x)
+        x = x.permute(0, 3, 1, 2)  # (batch_size, channels, height, width)
+        return x
+
+
 
 class NCATransformer(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim, n_heads, n_layers):
