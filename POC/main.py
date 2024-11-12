@@ -6,7 +6,8 @@ from torch.utils.data import DataLoader, TensorDataset, random_split
 from torch.utils.tensorboard import SummaryWriter
 import numpy as np
 import warnings
-import time
+import os
+import matplotlib.pyplot as plt
 
 warnings.filterwarnings("ignore")
 
@@ -16,6 +17,15 @@ np.random.seed(42)
 
 # Device configuration
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# Create directories for TensorBoard logs and intermediate outputs
+log_dir = 'runs/nca_transformer'
+intermediate_dir = 'intermediate_outputs'
+os.makedirs(log_dir, exist_ok=True)
+os.makedirs(intermediate_dir, exist_ok=True)
+
+# Initialize TensorBoard writer
+writer = SummaryWriter(log_dir=log_dir)
 
 class NCAModule(nn.Module):
     def __init__(self, state_dim, hidden_dim):
@@ -112,12 +122,14 @@ class NCAEncoder(nn.Module):
         x = self.embedding(src)
         x = self.positional_encoding(x)
         x = x.permute(1, 0, 2)  # (seq_len, batch_size, hidden_dim)
+        intermediate_outputs = []
         for layer in self.layers:
             x = layer(x)
-        return x
+            intermediate_outputs.append(x.permute(1, 0, 2))  # Store intermediate outputs
+        return x, intermediate_outputs
 
 class NCATransformer(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, n_heads, ff_dim, n_layers, nca_steps, dropout_rate=0.1):
+    def __init__(self, input_dim, hidden_dim, output_dim, n_heads, ff_dim, n_layers, nca_steps, dropout_rate):
         super(NCATransformer, self).__init__()
         self.encoder = NCAEncoder(input_dim, hidden_dim, n_heads, ff_dim, n_layers, nca_steps, dropout_rate)
         self.decoder = nn.TransformerDecoder(
@@ -127,15 +139,27 @@ class NCATransformer(nn.Module):
         self.fc_out = nn.Linear(hidden_dim, output_dim)
 
     def forward(self, src, tgt):
-        # src: (batch_size, src_seq_len)
-        # tgt: (batch_size, tgt_seq_len)
-        memory = self.encoder(src)
+        memory, intermediate_outputs = self.encoder(src)
         tgt_emb = self.encoder.embedding(tgt)
         tgt_emb = self.encoder.positional_encoding(tgt_emb)
         tgt_emb = tgt_emb.permute(1, 0, 2)  # (tgt_seq_len, batch_size, hidden_dim)
         output = self.decoder(tgt_emb, memory)
         output = self.fc_out(output)
-        return output.permute(1, 0, 2)  # (batch_size, tgt_seq_len, output_dim)
+        return output.permute(1, 0, 2), intermediate_outputs  # (batch_size, tgt_seq_len, output_dim)
+    
+# Function to save intermediate outputs as images
+def save_intermediate_outputs(intermediate_outputs, epoch, batch_idx):
+    for layer_idx, output in enumerate(intermediate_outputs):
+        output = output.permute(1, 0, 2).cpu().detach().numpy()  # (batch_size, seq_len, hidden_dim)
+        sample_output = output[0]  # Select the first sample in the batch
+        plt.figure(figsize=(10, 5))
+        plt.imshow(sample_output, aspect='auto', cmap='viridis')
+        plt.colorbar()
+        plt.title(f'Layer {layer_idx + 1} Output at Epoch {epoch + 1}, Batch {batch_idx + 1}')
+        plt.xlabel('Hidden Dimension')
+        plt.ylabel('Sequence Length')
+        plt.savefig(os.path.join(intermediate_dir, f'layer{layer_idx + 1}_epoch{epoch + 1}_batch{batch_idx + 1}.png'))
+        plt.close()
 
 # Hyperparameters
 input_dim = 100
@@ -149,7 +173,7 @@ dropout_rate = 0.1
 learning_rate = 0.001
 batch_size = 32
 num_epochs = 50
-patience = 5  # For early stopping
+patience = 5  # Early stopping patience
 
 # Sample data generation
 def generate_sample_data(num_samples, seq_len, vocab_size):
@@ -178,9 +202,6 @@ model = NCATransformer(input_dim, hidden_dim, output_dim, n_heads, ff_dim, n_lay
 criterion = nn.CrossEntropyLoss()
 optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 
-# TensorBoard writer
-writer = SummaryWriter()
-
 # Early stopping variables
 best_val_loss = float('inf')
 epochs_no_improve = 0
@@ -189,14 +210,17 @@ epochs_no_improve = 0
 for epoch in range(num_epochs):
     model.train()
     train_loss = 0.0
-    for src_batch, tgt_batch in train_loader:
+    for batch_idx, (src_batch, tgt_batch) in enumerate(train_loader):
         src_batch, tgt_batch = src_batch.to(device), tgt_batch.to(device)
         optimizer.zero_grad()
-        output = model(src_batch, tgt_batch)
+        output, intermediate_outputs = model(src_batch, tgt_batch)
         loss = criterion(output.reshape(-1, output_dim), tgt_batch.reshape(-1))
         loss.backward()
         optimizer.step()
         train_loss += loss.item() * src_batch.size(0)
+        
+        # Save intermediate outputs
+        save_intermediate_outputs(intermediate_outputs, epoch, batch_idx)
 
     train_loss /= len(train_loader.dataset)
 
@@ -206,32 +230,32 @@ for epoch in range(num_epochs):
     with torch.no_grad():
         for src_batch, tgt_batch in val_loader:
             src_batch, tgt_batch = src_batch.to(device), tgt_batch.to(device)
-            output = model(src_batch, tgt_batch)
+            output, _ = model(src_batch, tgt_batch)
             loss = criterion(output.reshape(-1, output_dim), tgt_batch.reshape(-1))
             val_loss += loss.item() * src_batch.size(0)
 
     val_loss /= len(val_loader.dataset)
 
-    # Logging
-    writer.add_scalars('Loss', {'train': train_loss, 'validation': val_loss}, epoch)
+    # Log losses to TensorBoard
+    writer.add_scalars('Loss', {'Train': train_loss, 'Validation': val_loss}, epoch)
     print(f'Epoch [{epoch+1}/{num_epochs}], Train Loss: {train_loss:.4f}, Validation Loss: {val_loss:.4f}')
-
 
     # Early stopping
     if val_loss < best_val_loss:
         best_val_loss = val_loss
         epochs_no_improve = 0
-        # Save the best model
         torch.save(model.state_dict(), 'best_model.pth')
     else:
         epochs_no_improve += 1
         if epochs_no_improve >= patience:
             print('Early stopping triggered.')
             break
-            
 
 writer.close()
 
 # Load the best model for evaluation or inference
 model.load_state_dict(torch.load('best_model.pth'))
 model.eval()
+
+
+

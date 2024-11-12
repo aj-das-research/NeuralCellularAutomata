@@ -50,3 +50,10 @@ Thumbs.db
 *.pth
 *.pt
 *.pkl
+# TensorBoard logs
+runs/
+logs/
+
+# Generated images and outputs
+*.png
+intermediate_outputs/
